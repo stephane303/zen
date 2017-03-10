@@ -33,6 +33,16 @@
 #include <boost/filesystem.hpp>
 #include <boost/thread.hpp>
 
+// Used for E2E Encryption in Zen
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/ossl_typ.h>
+#include <openssl/conf.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <stdio.h> // debugging
+
 // Dump addresses to peers.dat every 15 minutes (900s)
 #define DUMP_ADDRESSES_INTERVAL 900
 
@@ -102,6 +112,63 @@ CCriticalSection cs_nLastNodeId;
 
 static CSemaphore *semOutbound = NULL;
 boost::condition_variable messageHandlerCondition;
+
+// OpenSSL Functions
+void init_openssl_library()
+{
+    (void)SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl()
+{
+    EVP_cleanup();
+}
+
+int verify_callback(int preverify, X509_STORE_CTX* x509_ctx)
+{
+    int err = X509_STORE_CTX_get_error(x509_ctx);
+    if (err != X509_V_OK) {
+        // TODO: Add Untrusted Flag
+        preverify = 1; // WARNING THIS ALLOWS ALL UNVERIFIED CONNECTIONS!
+    }
+
+    return preverify;
+}
+
+SSL_CTX *create_context()
+{
+    const SSL_METHOD *method;
+    SSL_CTX *ctx;
+
+    method = TLS_server_method();
+
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+	perror("Unable to create TLS context");
+	ERR_print_errors_fp(stderr);
+	exit(EXIT_FAILURE);
+    }
+
+    return ctx;
+}
+
+void configure_context(SSL_CTX *ctx)
+{
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+
+    /* Set the key and cert */
+    if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) < 0) {
+        ERR_print_errors_fp(stderr);
+	exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) < 0 ) {
+        ERR_print_errors_fp(stderr);
+	exit(EXIT_FAILURE);
+    }
+}
 
 // Signals for message handling
 static CNodeSignals g_signals;
@@ -370,8 +437,26 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
         pszDest ? pszDest : addrConnect.ToString(),
         pszDest ? 0.0 : (double)(GetAdjustedTime() - addrConnect.nTime)/3600.0);
 
-    // Connect
+    // Connect Raw Socket
     SOCKET hSocket;
+
+    // Establish OpenSSL BIO
+    init_openssl_library();
+    BIO *BIO_node = NULL;
+    BIO *BIO_ssl;
+    SSL_CTX* ctx = NULL;
+    const SSL_METHOD* method = TLS_client_method();
+    ctx = SSL_CTX_new(method);
+    size_t error;
+
+    // Verify handshake
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_callback); // FIXME/SECURITY: Check certificates
+    SSL_CTX_set_verify_depth(ctx, 4);
+
+    // Force TLSv1.2
+    const long flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_COMPRESSION;
+    SSL_CTX_set_options(ctx, flags);
+
     bool proxyConnectionFailed = false;
     if (pszDest ? ConnectSocketByName(addrConnect, hSocket, pszDest, Params().GetDefaultPort(), nConnectTimeout, &proxyConnectionFailed) :
                   ConnectSocket(addrConnect, hSocket, nConnectTimeout, &proxyConnectionFailed))
@@ -384,8 +469,23 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
 
         addrman.Attempt(addrConnect);
 
+        // Setup BIO on existing network socket
+        BIO_node = BIO_new(BIO_s_socket());
+        BIO_set_fd(BIO_node, hSocket, BIO_NOCLOSE);
+
+        // Create TLS BIO and route over network socket
+        BIO_ssl = BIO_new_ssl(ctx, 1);
+        BIO_push(BIO_ssl, BIO_node);
+
+        error = BIO_do_handshake(BIO_ssl);
+        if (error == 1) {
+            return NULL;
+        }
+
+        LogPrintf("TLS connections established! peer=%s\n", addrConnect.ToStringIP());
+
         // Add node
-        CNode* pnode = new CNode(hSocket, addrConnect, pszDest ? pszDest : "", false);
+        CNode* pnode = new CNode(hSocket, BIO_ssl, addrConnect, pszDest ? pszDest : "", false);
         pnode->AddRef();
 
         {
@@ -633,7 +733,16 @@ void SocketSendData(CNode *pnode)
     while (it != pnode->vSendMsg.end()) {
         const CSerializeData &data = *it;
         assert(data.size() > pnode->nSendOffset);
-        int nBytes = send(pnode->hSocket, &data[pnode->nSendOffset], data.size() - pnode->nSendOffset, MSG_NOSIGNAL | MSG_DONTWAIT);
+        int nBytes;
+        while(1) {
+            nBytes = BIO_write(pnode->BIO_ssl, &data[pnode->nSendOffset], data.size() - pnode->nSendOffset);
+            if (nBytes != data.size() - pnode->nSendOffset && !BIO_should_retry(pnode->BIO_ssl)) {
+                return;
+            }
+            else if (nBytes != data.size() - pnode->nSendOffset) {
+                break;
+            }
+        }
         if (nBytes > 0) {
             pnode->nLastSend = GetTime();
             pnode->nSendBytes += nBytes;
@@ -824,6 +933,19 @@ static bool AttemptToEvictConnection(bool fPreferNewConnection) {
 }
 
 static void AcceptConnection(const ListenSocket& hListenSocket) {
+    // Initialize OpenSSL BIOs
+    init_openssl_library();
+    BIO *BIO_node = NULL;
+    BIO *BIO_ssl = NULL;
+    SSL_CTX *ctx = NULL;
+    ctx = create_context();
+    configure_context(ctx);
+    size_t error;
+
+    // Force TLSv1.2
+    const long flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_COMPRESSION;
+    SSL_CTX_set_options(ctx, flags);
+
     struct sockaddr_storage sockaddr;
     socklen_t len = sizeof(sockaddr);
     SOCKET hSocket = accept(hListenSocket.socket, (struct sockaddr*)&sockaddr, &len);
@@ -875,6 +997,19 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
         }
     }
 
+    // Setup BIO on existing network socket
+    BIO_node = BIO_new(BIO_s_socket());
+    BIO_set_fd(BIO_node, hSocket, BIO_NOCLOSE);
+
+    // Create TLS BIO and route over network socket
+    BIO_ssl = BIO_new_ssl(ctx, 0);
+    BIO_push(BIO_ssl, BIO_node);
+
+    error = BIO_do_handshake(BIO_ssl);
+    if (error != 1) {
+        return;
+    }
+
     // According to the internet TCP_NODELAY is not carried into accepted sockets
     // on all platforms.  Set it again here just to be sure.
     int set = 1;
@@ -884,7 +1019,7 @@ static void AcceptConnection(const ListenSocket& hListenSocket) {
     setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (void*)&set, sizeof(int));
 #endif
 
-    CNode* pnode = new CNode(hSocket, addr, "", true);
+    CNode* pnode = new CNode(hSocket, BIO_ssl, addr, "", true);
     pnode->AddRef();
     pnode->fWhitelisted = whitelisted;
 
@@ -1084,7 +1219,8 @@ void ThreadSocketHandler()
                     {
                         // typical socket buffer is 8K-64K
                         char pchBuf[0x10000];
-                        int nBytes = recv(pnode->hSocket, pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+                        //int nBytes = recv(pnode->hSocket, pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+                        int nBytes = BIO_read(pnode->BIO_ssl, pchBuf, sizeof(pchBuf));
                         if (nBytes > 0)
                         {
                             if (!pnode->ReceiveMsgBytes(pchBuf, nBytes))
@@ -1651,6 +1787,30 @@ bool BindListenPort(const CService &addrBind, string& strError, bool fWhiteliste
     strError = "";
     int nOne = 1;
 
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
+    {
+        strError = strprintf("Error: Bind address family for %s not supported", addrBind.ToString());
+        LogPrintf("%s\n", strError);
+        return false;
+    }
+
+    SOCKET hListenSocket = socket(((struct sockaddr*)&sockaddr)->sa_family, SOCK_STREAM, IPPROTO_TCP);
+    if (hListenSocket == INVALID_SOCKET)
+    {
+        strError = strprintf("Error: Couldn't open socket for incoming connections (socket returned error %s)", NetworkErrorString(WSAGetLastError()));
+        LogPrintf("%s\n", strError);
+        return false;
+    }
+    if (!IsSelectableSocket(hListenSocket))
+    {
+        strError = "Error: Couldn't create a listenable socket for incoming connections";
+        LogPrintf("%s\n", strError);
+        return false;
+    }
+
+    /*
     // Create socket for listening for incoming connections
     struct sockaddr_storage sockaddr;
     socklen_t len = sizeof(sockaddr);
@@ -1674,6 +1834,7 @@ bool BindListenPort(const CService &addrBind, string& strError, bool fWhiteliste
         LogPrintf("%s\n", strError);
         return false;
     }
+    */
 
 
 #ifndef WIN32
@@ -1814,9 +1975,9 @@ void StartNode(boost::thread_group& threadGroup, CScheduler& scheduler)
         int nMaxOutbound = min(MAX_OUTBOUND_CONNECTIONS, nMaxConnections);
         semOutbound = new CSemaphore(nMaxOutbound);
     }
-
+    BIO *BIO_node = NULL;
     if (pnodeLocalHost == NULL)
-        pnodeLocalHost = new CNode(INVALID_SOCKET, CAddress(CService("127.0.0.1", 0), nLocalServices));
+        pnodeLocalHost = new CNode(INVALID_SOCKET, NULL, CAddress(CService("127.0.0.1", 0), nLocalServices));
 
     Discover(threadGroup);
 
@@ -2110,11 +2271,12 @@ bool CAddrDB::Read(CAddrMan& addr)
 unsigned int ReceiveFloodSize() { return 1000*GetArg("-maxreceivebuffer", 5*1000); }
 unsigned int SendBufferSize() { return 1000*GetArg("-maxsendbuffer", 1*1000); }
 
-CNode::CNode(SOCKET hSocketIn, CAddress addrIn, std::string addrNameIn, bool fInboundIn) :
+CNode::CNode(SOCKET hSocketIn, BIO *BIO_sslIn, CAddress addrIn, std::string addrNameIn, bool fInboundIn) :
     ssSend(SER_NETWORK, INIT_PROTO_VERSION),
     addrKnown(5000, 0.001),
     setInventoryKnown(SendBufferSize() / 1000)
 {
+    BIO_ssl = BIO_sslIn; //OpenSSL Support
     nServices = 0;
     hSocket = hSocketIn;
     nRecvVersion = INIT_PROTO_VERSION;
