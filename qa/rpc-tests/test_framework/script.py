@@ -822,10 +822,10 @@ class CScript(bytes):
         return n
 
 
-SIGHASH_ALL = 1
-SIGHASH_NONE = 2
-SIGHASH_SINGLE = 3
-SIGHASH_ANYONECANPAY = 0x80
+SIGHASH_ALL = 0x10
+SIGHASH_NONE = 0x11
+SIGHASH_SINGLE = 0x12
+SIGHASH_ANYONECANPAY = 0x90
 
 def FindAndDelete(script, sig):
     """Consensus critical, see FindAndDelete() in Satoshi codebase"""
